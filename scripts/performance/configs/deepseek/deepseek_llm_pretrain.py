@@ -44,6 +44,9 @@ def set_deepseek_v3_common_configs(cfg: ConfigContainer, moe_a2a_overlap: bool =
 
     cfg.model.moe_router_force_load_balancing = True
 
+    cfg.optimizer.optimizer_cuda_graph = True
+    cfg.checkpoint.save = None
+
 
 def deepseek_v3_pretrain_config_gb300(
     precision: str = "bf16", mock: bool = True, config_variant: str = "v1"

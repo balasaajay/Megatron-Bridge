@@ -43,6 +43,9 @@ def set_qwen3_common_configs(cfg: ConfigContainer) -> None:
 
     cfg.model.moe_router_force_load_balancing = True  # required for token dropless
 
+    cfg.optimizer.optimizer_cuda_graph = True
+    cfg.checkpoint.save = None
+
 
 def qwen3_235b_a22b_pretrain_config_gb300(
     precision: str = "bf16", mock: bool = True, config_variant: str = "v1"

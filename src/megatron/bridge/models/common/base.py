@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import abc
-import importlib
 from dataclasses import dataclass, field, is_dataclass
 from dataclasses import fields as dataclass_fields
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
@@ -23,6 +22,8 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
+
+from megatron.bridge.utils.instantiate_utils import _resolve_target, _validate_target_prefix
 
 
 @runtime_checkable
@@ -97,9 +98,9 @@ class ModelConfig:
         """Get the appropriate builder type for this config.
         Dynamically imports the builder from the string path.
         """
-        module_path, class_name = self.builder.rsplit(".", 1)
-        module = importlib.import_module(module_path)
-        builder_cls = getattr(module, class_name)
+        builder_cls = _resolve_target(self.builder, full_key="_builder_")
+        if not isinstance(builder_cls, type):
+            raise TypeError(f"Builder target '{self.builder}' did not resolve to a class.")
         return builder_cls
 
     def as_dict(self) -> dict[str, Any]:
@@ -146,15 +147,16 @@ class ModelConfig:
             Instance of the appropriate ModelConfig subclass
         """
 
-        def _from_dict(subdata):
+        def _from_dict(subdata: dict[str, Any], full_key: str) -> Any:
             target = subdata.get("_target_")
             if target is None:
                 raise ValueError("Cannot deserialize: missing '_target_' field")
+            if not isinstance(target, str):
+                raise ValueError(f"Cannot deserialize: '_target_' must be a string, got {type(target).__name__}")
 
-            # Import the class from the target path
-            module_path, class_name = target.rsplit(".", 1)
-            module = importlib.import_module(module_path)
-            config_cls = getattr(module, class_name)
+            config_cls = _resolve_target(target, full_key=full_key)
+            if not isinstance(config_cls, type) or not is_dataclass(config_cls):
+                raise ValueError(f"Cannot deserialize: target '{target}' did not resolve to a dataclass type")
 
             # Filter to valid fields for this class
             valid_fields = {f.name for f in dataclass_fields(config_cls)}
@@ -164,13 +166,18 @@ class ModelConfig:
             subconfigs = {}
             for k, v in filtered_data.items():
                 if isinstance(v, dict) and "_target_" in v:
-                    subconfigs[k] = _from_dict(v)
+                    subconfigs[k] = _from_dict(v, full_key=f"{full_key}.{k}")
             filtered_data.update(subconfigs)
 
             return config_cls(**filtered_data)
 
-        result = _from_dict(data)
-        result.builder = data["_builder_"]
+        builder = data.get("_builder_")
+        if not isinstance(builder, str):
+            raise ValueError("Cannot deserialize: missing '_builder_' field")
+        _validate_target_prefix(target=builder, full_key="_builder_")
+
+        result = _from_dict(data, full_key="_target_")
+        result.builder = builder
 
         return result
 

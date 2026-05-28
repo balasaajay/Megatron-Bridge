@@ -42,6 +42,10 @@ _ALLOWED_TARGET_PREFIXES: set[str] = {
     "nemo.",
 }
 
+_DISALLOWED_TARGETS: set[str] = {
+    "megatron.bridge.utils.instantiate_utils.register_allowed_target_prefix",
+}
+
 
 def register_allowed_target_prefix(prefix: str) -> None:
     """Register an additional allowed module prefix for _target_ instantiation.
@@ -56,6 +60,17 @@ def register_allowed_target_prefix(prefix: str) -> None:
 
 def _validate_target_prefix(*, target: str, full_key: str) -> None:
     """Validate that a _target_ string starts with an allowed module prefix."""
+    if target in _DISALLOWED_TARGETS:
+        raise InstantiationException(
+            f"Instantiation of '{target}' is not allowed because it can modify target validation state."
+            + (f"\nfull_key: {full_key}" if full_key else "")
+        )
+    private_segments = [segment for segment in target.split(".") if segment.startswith("_")]
+    if private_segments:
+        raise InstantiationException(
+            f"Instantiation of '{target}' is not allowed because private target path segments are not supported: "
+            f"{private_segments}." + (f"\nfull_key: {full_key}" if full_key else "")
+        )
     if not any(target.startswith(prefix) for prefix in _ALLOWED_TARGET_PREFIXES):
         raise InstantiationException(
             f"Instantiation of '{target}' is not allowed. "

@@ -19,6 +19,7 @@ from unittest.mock import Mock
 import pytest
 
 from megatron.bridge.models.common.base import ModelBuilder, ModelConfig, compose_hooks
+from megatron.bridge.utils.instantiate_utils import InstantiationException
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +202,10 @@ class TestModelConfigFromDict:
         assert cfg.name == "reconstructed"
 
     def test_builder_restored(self):
-        d = self._dummy_dict(_builder_="fake.builder.string")
+        builder = f"{DummyModelBuilder.__module__}.DummyModelBuilder"
+        d = self._dummy_dict(_builder_=builder)
         cfg = ModelConfig.from_dict(d)
-        assert cfg.builder == "fake.builder.string"
+        assert cfg.builder == builder
 
     def test_ignores_unknown_fields(self):
         d = self._dummy_dict(unknown_field="should_be_ignored", another_unknown=123)
@@ -217,6 +219,17 @@ class TestModelConfigFromDict:
     def test_raises_if_target_missing(self):
         d = {"_builder_": DummyModelConfig.builder, "value": 1}
         with pytest.raises(ValueError):
+            ModelConfig.from_dict(d)
+
+    def test_rejects_disallowed_target(self):
+        d = DummyNestedModelConfig().as_dict()
+        d["sub"] = {"_target_": "os.system"}
+        with pytest.raises(InstantiationException, match="is not allowed"):
+            ModelConfig.from_dict(d)
+
+    def test_rejects_disallowed_builder(self):
+        d = self._dummy_dict(_builder_="os.system")
+        with pytest.raises(InstantiationException, match="is not allowed"):
             ModelConfig.from_dict(d)
 
     def test_round_trip_flat(self):

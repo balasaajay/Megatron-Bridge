@@ -202,8 +202,7 @@ def _validate_mimo_batch_sizes(
             raise ValueError(f"Component {name!r} must set dp explicitly.")
         if args.micro_batch_size % dp != 0:
             raise ValueError(
-                f"--micro-batch-size ({args.micro_batch_size}) must be divisible by "
-                f"component {name!r} dp ({dp})."
+                f"--micro-batch-size ({args.micro_batch_size}) must be divisible by component {name!r} dp ({dp})."
             )
         summaries.append(f"{name}: dp={dp}, local_mbs={args.micro_batch_size // dp}")
     return summaries

@@ -102,13 +102,44 @@ def test_bootstrap_exports_flat_recipe_environment_before_exec(monkeypatch):
 
     monkeypatch.setattr(run_script, "_prepare_perf_recipe", get_recipe)
     monkeypatch.setattr(bootstrap, "_apply_recipe_environment", lambda config: calls.append(("environment", config)))
+    monkeypatch.setattr(bootstrap, "_log_nccl_plugin", lambda: calls.append(("nccl_plugin",)))
     monkeypatch.setattr(bootstrap.os, "execvpe", exec_runner)
 
     bootstrap.main()
 
-    assert [call[0] for call in calls] == ["recipe", "environment", "exec"]
+    assert [call[0] for call in calls] == ["recipe", "environment", "nccl_plugin", "exec"]
     assert calls[1] == ("environment", recipe)
-    assert calls[2][2][1].endswith("run_script.py")
+    assert calls[3][2][1].endswith("run_script.py")
+
+
+def test_bootstrap_logs_nccl_plugin_on_rank_zero(monkeypatch, caplog):
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("NCCL_NET_PLUGIN", "gcp")
+
+    with caplog.at_level("WARNING", logger=bootstrap.__name__):
+        bootstrap._log_nccl_plugin()
+
+    assert caplog.messages == ["NCCL_NET_PLUGIN=gcp"]
+
+
+def test_bootstrap_does_not_log_nccl_plugin_on_nonzero_rank(monkeypatch, caplog):
+    monkeypatch.setenv("RANK", "1")
+
+    with caplog.at_level("WARNING", logger=bootstrap.__name__):
+        bootstrap._log_nccl_plugin()
+
+    assert caplog.messages == []
+
+
+def test_bootstrap_logs_unset_nccl_plugin_on_slurm_rank_zero(monkeypatch, caplog):
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.setenv("SLURM_PROCID", "0")
+    monkeypatch.delenv("NCCL_NET_PLUGIN", raising=False)
+
+    with caplog.at_level("WARNING", logger=bootstrap.__name__):
+        bootstrap._log_nccl_plugin()
+
+    assert caplog.messages == ["NCCL_NET_PLUGIN=<unset>"]
 
 
 def test_bootstrap_exec_preserves_argv_and_environment(monkeypatch):

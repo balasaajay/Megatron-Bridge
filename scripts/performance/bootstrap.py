@@ -15,6 +15,7 @@
 
 """Apply recipe process settings before executing performance training."""
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ from argument_parser import parse_cli_args
 
 ENTRYPOINT_PERFORMANCE = "run_script.py"
 ENTRYPOINT_RECIPE = "run_recipe.py"
+logger = logging.getLogger(__name__)
 
 
 def _prepare_recipe_and_target(args, cli_overrides: list[str]):
@@ -50,6 +52,13 @@ def _apply_recipe_environment(recipe) -> None:
         os.environ.setdefault(name, str(value))
 
 
+def _log_nccl_plugin() -> None:
+    """Log the effective NCCL network plugin once per distributed run."""
+    rank = os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0"))
+    if rank == "0":
+        logger.warning("NCCL_NET_PLUGIN=%s", os.environ.get("NCCL_NET_PLUGIN", "<unset>"))
+
+
 def _exec_training(target_name: str) -> None:
     """Replace the bootstrap process with the selected training entrypoint."""
     target_path = Path(__file__).resolve().parent / target_name
@@ -66,6 +75,7 @@ def main() -> None:
     args, cli_overrides = parser.parse_known_args()
     recipe, target_name = _prepare_recipe_and_target(args, cli_overrides)
     _apply_recipe_environment(recipe)
+    _log_nccl_plugin()
     _exec_training(target_name)
 
 

@@ -38,8 +38,11 @@ if HAS_NEMO_RUN:
     from setup_experiment import _build_nemorun_script
     from utils import executors as executors_module
     from utils.executors import (
+        KUBEFLOW_NCCL_NET_PLUGIN_LOG_ENV,
         KUBEFLOW_NUMA_BINDING_ENV,
         OFFLINE_BENCHMARK_ENV_VARS,
+        _kubeflow_nccl_net_plugin_logging_enabled,
+        _kubeflow_nccl_net_plugin_logging_script,
         _kubeflow_numa_binding_enabled,
         _kubeflow_numa_binding_script,
         kubeflow_executor,
@@ -114,6 +117,29 @@ def test_kubeflow_numa_binding_wraps_each_torchrun_worker():
 
 
 @pytest.mark.skipif(not HAS_NEMO_RUN, reason="nemo_run not installed")
+def test_kubeflow_nccl_net_plugin_logging_wraps_rank_zero():
+    assert _kubeflow_nccl_net_plugin_logging_enabled({KUBEFLOW_NCCL_NET_PLUGIN_LOG_ENV: "true"})
+    task = nemo_run.Script(
+        path="train.py",
+        entrypoint="python",
+        args=["--steps", "10"],
+        env={"PYTHONPATH": "/workspace:$PYTHONPATH"},
+        metadata={"test": "value"},
+    )
+
+    wrapper = _kubeflow_nccl_net_plugin_logging_script(task)
+
+    assert "${RANK:-${SLURM_PROCID:-0}}" in wrapper.inline
+    assert "NCCL_NET_PLUGIN=%s" in wrapper.inline
+    assert '"${NCCL_NET_PLUGIN:-<unset>}"' in wrapper.inline
+    assert "exec python train.py --steps 10" in wrapper.inline
+    assert wrapper.env == task.env
+    assert wrapper.env is not task.env
+    assert wrapper.metadata == task.metadata
+    assert wrapper.metadata is not task.metadata
+
+
+@pytest.mark.skipif(not HAS_NEMO_RUN, reason="nemo_run not installed")
 def test_build_nemorun_script_wraps_only_enabled_kubeflow_tasks():
     """The setup helper must preserve task env while gating the Kubeflow wrapper."""
     kwargs = {
@@ -144,6 +170,34 @@ def test_build_nemorun_script_wraps_only_enabled_kubeflow_tasks():
     assert disabled.env == expected_env
     assert not non_kubeflow.inline
     assert non_kubeflow.env == expected_env
+
+
+@pytest.mark.skipif(not HAS_NEMO_RUN, reason="nemo_run not installed")
+def test_build_nemorun_script_gates_nccl_logging_to_enabled_kubeflow_tasks():
+    kwargs = {
+        "script_path": "/opt/Megatron-Bridge/scripts/performance/run_recipe.py",
+        "script_dir": "/opt/Megatron-Bridge/scripts/performance",
+        "args": ["--steps", "10"],
+    }
+    enabled = _build_nemorun_script(
+        **kwargs,
+        kubeflow_namespace="nemo-ci",
+        custom_env_vars={KUBEFLOW_NCCL_NET_PLUGIN_LOG_ENV: "1"},
+    )
+    disabled = _build_nemorun_script(
+        **kwargs,
+        kubeflow_namespace="nemo-ci",
+        custom_env_vars={},
+    )
+    non_kubeflow = _build_nemorun_script(
+        **kwargs,
+        kubeflow_namespace=None,
+        custom_env_vars={KUBEFLOW_NCCL_NET_PLUGIN_LOG_ENV: "1"},
+    )
+
+    assert "NCCL_NET_PLUGIN=%s" in enabled.inline
+    assert not disabled.inline
+    assert not non_kubeflow.inline
 
 
 @pytest.mark.skipif(not HAS_NEMO_RUN, reason="nemo_run not installed")

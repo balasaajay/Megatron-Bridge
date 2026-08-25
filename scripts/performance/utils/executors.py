@@ -28,6 +28,34 @@ DEFAULT_NEMO_HOME = os.getenv("NEMO_HOME", DEFAULT_NEMO_CACHE_HOME)
 logger = logging.getLogger(__name__)
 
 KUBEFLOW_NUMA_BINDING_ENV = "NEMO_KUBEFLOW_NUMA_BINDING"
+KUBEFLOW_NCCL_NET_PLUGIN_LOG_ENV = "NEMO_LOG_NCCL_NET_PLUGIN"
+
+
+def _kubeflow_nccl_net_plugin_logging_script(task: run.Script) -> run.Script:
+    """Log the trainer's effective NCCL net plugin before starting training."""
+    training_command = shlex.join(task.to_command(with_entrypoint=True))
+    return run.Script(
+        env=task.env.copy(),
+        metadata=task.metadata.copy(),
+        inline=f"""
+set -euo pipefail
+
+if [[ "${{RANK:-${{SLURM_PROCID:-0}}}}" == "0" ]]; then
+    printf 'NCCL_NET_PLUGIN=%s\\n' "${{NCCL_NET_PLUGIN:-<unset>}}"
+fi
+exec {training_command}
+""",
+    )
+
+
+def _kubeflow_nccl_net_plugin_logging_enabled(env_vars: Dict[str, str]) -> bool:
+    """Return whether rank-zero NCCL net plugin logging is enabled."""
+    return str(env_vars.get(KUBEFLOW_NCCL_NET_PLUGIN_LOG_ENV, "")).lower() in {
+        "1",
+        "on",
+        "true",
+        "yes",
+    }
 
 
 def _kubeflow_numa_binding_script(task: run.Script) -> run.Script:

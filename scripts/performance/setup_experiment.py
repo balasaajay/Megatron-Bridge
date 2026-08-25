@@ -32,6 +32,8 @@ from nemo_run.config import get_nemorun_home
 try:
     from argument_parser import NUM_GPUS_PER_NODE_MAP, parse_cli_args
     from utils.executors import (
+        _kubeflow_nccl_net_plugin_logging_enabled,
+        _kubeflow_nccl_net_plugin_logging_script,
         _kubeflow_numa_binding_enabled,
         _kubeflow_numa_binding_script,
         kubeflow_executor,
@@ -41,6 +43,8 @@ try:
 except (ImportError, ModuleNotFoundError):
     from .argument_parser import NUM_GPUS_PER_NODE_MAP, parse_cli_args
     from .utils.executors import (
+        _kubeflow_nccl_net_plugin_logging_enabled,
+        _kubeflow_nccl_net_plugin_logging_script,
         _kubeflow_numa_binding_enabled,
         _kubeflow_numa_binding_script,
         kubeflow_executor,
@@ -162,6 +166,9 @@ def _build_nemorun_script(
         env={"PYTHONPATH": f"{script_dir}:{in_container_repo_root / 'src'}:$PYTHONPATH"},
         args=args,
     )
+    if kubeflow_namespace and _kubeflow_nccl_net_plugin_logging_enabled(custom_env_vars):
+        logger.info("Enabling rank-zero NCCL_NET_PLUGIN logging for Kubeflow workers")
+        task = _kubeflow_nccl_net_plugin_logging_script(task)
     if kubeflow_namespace and _kubeflow_numa_binding_enabled(custom_env_vars):
         logger.info("Enabling per-rank GPU-local NUMA binding for Kubeflow torchrun workers")
         return _kubeflow_numa_binding_script(task)

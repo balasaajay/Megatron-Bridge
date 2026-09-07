@@ -1406,7 +1406,9 @@ class AutoBridge(Generic[MegatronModelT]):
             - The model architecture must match the bridge configuration
         """
         try:
+            from megatron.bridge.training.checkpointing import _resolve_checkpoint_iteration
             from megatron.bridge.training.model_load_save import load_megatron_model
+            from megatron.bridge.training.utils.checkpoint_utils import get_checkpoint_name
         except ImportError:
             raise ImportError("megatron.bridge.training is not available.")
 
@@ -1416,6 +1418,10 @@ class AutoBridge(Generic[MegatronModelT]):
             register_allowed_target_prefix("transformers_modules.")
 
         checkpoint_path = Path(path)
+
+        iteration, release = _resolve_checkpoint_iteration(str(checkpoint_path), None)
+        if iteration >= 0 or release:
+            checkpoint_path = Path(get_checkpoint_name(str(checkpoint_path), iteration, release))
 
         # Check for iter_* folders
         iter_folders = [f for f in checkpoint_path.iterdir() if f.is_dir() and f.name.startswith("iter_")]
@@ -1433,10 +1439,13 @@ class AutoBridge(Generic[MegatronModelT]):
         # else: checkpoint_path remains as the input path (no iter folders found)
 
         skip_temp_dist_context = dist.is_initialized()
+        use_cpu_init = kwargs.get("use_cpu_initialization")
+        if use_cpu_init is None:
+            use_cpu_init = skip_temp_dist_context and dist.get_backend() == "gloo"
         # Load the state dict
         model = load_megatron_model(
             str(checkpoint_path),
-            use_cpu_init=(skip_temp_dist_context and dist.get_backend() == "gloo"),
+            use_cpu_init=use_cpu_init,
             skip_temp_dist_context=skip_temp_dist_context,
             mp_overrides=mp_overrides,
         )
@@ -1495,8 +1504,18 @@ class AutoBridge(Generic[MegatronModelT]):
 
         model_context = nullcontext() if dist.is_initialized() else temporary_distributed_context(backend="gloo")
         with model_context:
-            # Convert to Megatron model
-            megatron_model = bridge.to_megatron_model(wrap_with_ddp=False, use_cpu_initialization=True)
+            # Prefer the native ModelConfig/ModelBuilder path for migrated model
+            # families while preserving the provider path for legacy bridges.
+            if bridge._model_bridge.USE_MODEL_CONFIG_FOR_CONVERSION:
+                model_config = bridge.get_model_config()
+                model_config.transformer.use_cpu_initialization = True
+                megatron_model = bridge.get_model(
+                    model_config,
+                    wrap_with_ddp=False,
+                    mixed_precision_wrapper=None,
+                )
+            else:
+                megatron_model = bridge.to_megatron_model(wrap_with_ddp=False, use_cpu_initialization=True)
 
             # Save as Megatron checkpoint
             hf_tokenizer_kwargs = {}
@@ -1878,6 +1897,8 @@ class AutoBridge(Generic[MegatronModelT]):
                 pg_collection = self._get_or_initialize_pg_collection(transformer_config)
             kwargs.setdefault("data_parallel_random_init", False)
             models = builder.build_distributed_models(pg_collection=pg_collection, **kwargs)
+            for model in models:
+                model.model_config = model_config
             succeeded = True
         finally:
             transformer_config.perform_initialization = original_perform_initialization

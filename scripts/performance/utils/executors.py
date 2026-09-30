@@ -44,8 +44,9 @@ class DiagnosticKubeflowExecutor(run.KubeflowExecutor):
     """Persist bounded Nsight reports for the isolated GCP diagnostic launcher.
 
     NeMo-Run calls ``cleanup`` on its assigned executor after a terminal job.
-    Reports are copied into the existing CI artifact directory, separated by
-    experiment and task, so automatic retries cannot shadow completed captures.
+    Reports are copied under the assigned experiment/task directory for CI's
+    postflight artifact collection. The frozen CI selects the first profile
+    directory, so this diagnostic requires a single launcher attempt.
     The normal, non-profiled execution path is unchanged.
     """
 
@@ -67,11 +68,12 @@ class DiagnosticKubeflowExecutor(run.KubeflowExecutor):
         return launcher.get_nsys_prefix(profile_dir=self.code_dir)
 
     def _profile_destination(self) -> Path:
+        if not self.job_dir:
+            raise ValueError("Nsight artifacts require an assigned job directory")
         for component in (self.experiment_id, self.job_name):
             if not component or component in (".", "..") or Path(component).name != component:
                 raise ValueError("Nsight artifact paths require single-component experiment and task names")
-        root = Path(os.environ.get("CI_PROJECT_DIR", self.job_dir)) / "nsys_profile"
-        destination = root / self.experiment_id / self.job_name
+        destination = Path(self.job_dir) / "nsys_profile"
         destination.mkdir(parents=True, exist_ok=True, mode=0o700)
         destination.chmod(0o700)
         return destination
@@ -104,6 +106,17 @@ done
             reports.append({"name": name, "bytes": int(size)})
         return sorted(reports, key=lambda report: str(report["name"]))
 
+    def _copy_profile(self, pod_name: str, remote_path: str, local_path: Path) -> None:
+        # The inherited _rsync_from_pod creates a directory at its destination;
+        # kubectl cp needs an explicit local filename for this single-file copy.
+        subprocess.run(
+            ["kubectl", "cp", "-n", self.namespace, f"{pod_name}:{remote_path}", str(local_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+
     def cleanup(self, handle: str) -> None:
         """Collect native reports with a byte limit and a durable outcome manifest."""
         super().cleanup(handle)
@@ -131,8 +144,8 @@ done
                 else:
                     for report in reports:
                         name = str(report["name"])
-                        self._rsync_from_pod(pod_name, f"{remote_path}/{name}", str(destination))
                         local_report = destination / name
+                        self._copy_profile(pod_name, f"{remote_path}/{name}", local_report)
                         info = local_report.lstat()
                         if not stat.S_ISREG(info.st_mode) or info.st_size != report["bytes"]:
                             raise ValueError("Collected Nsight report does not match its inventory")

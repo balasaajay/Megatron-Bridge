@@ -15,6 +15,7 @@
 """Tests for scripts/performance/utils/executors.py — container_env on SlurmExecutor."""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -258,7 +259,7 @@ def diagnostic_executor(tmp_path, monkeypatch, mock_kubeflow_clients):
     executor.assign("attempt-1", str(tmp_path / "run"), "training", "training")
     monkeypatch.setattr(executor, "_start_data_mover_pod", Mock())
     monkeypatch.setattr(executor, "_delete_data_mover_pod", Mock())
-    monkeypatch.setattr(executor, "_rsync_from_pod", Mock())
+    monkeypatch.setattr(executor, "_copy_profile", Mock())
     return executor
 
 
@@ -432,7 +433,83 @@ def test_diagnostic_rejects_unsafe_inventory(diagnostic_executor, monkeypatch, i
 
 
 @pytest.mark.unit
-def test_diagnostic_collects_attempts_separately_and_retains_empty_attempt(diagnostic_executor, monkeypatch):
+def test_diagnostic_copy_passes_a_filename_to_kubectl(diagnostic_executor, tmp_path, monkeypatch):
+    executor = diagnostic_executor
+    name = "profile_node0_pid7.nsys-rep"
+    monkeypatch.setattr(executor, "_profile_inventory", Mock(return_value=[{"name": name, "bytes": 12}]))
+    # Exercise the subprocess boundary: the old inherited helper creates and
+    # passes a directory, which kubectl cp cannot open as a local output file.
+    monkeypatch.delattr(executor, "_copy_profile")
+    command_log = tmp_path / "copy-argv.json"
+    monkeypatch.setenv("COPY_ARGV_LOG", str(command_log))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    kubectl = bin_dir / "kubectl"
+    kubectl.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['COPY_ARGV_LOG']).write_text(json.dumps(sys.argv[1:]))\n"
+        "assert sys.argv[1] == 'cp'\n"
+        "Path(sys.argv[-1]).write_bytes(b'x' * 12)\n"
+    )
+    kubectl.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+    invoke = Mock(wraps=executors_module.subprocess.run)
+    monkeypatch.setattr(executors_module.subprocess, "run", invoke)
+    executor.cleanup("test")
+    destination = executor._profile_destination()
+    assert json.loads(command_log.read_text()) == [
+        "cp",
+        "-n",
+        "test",
+        f"{executor._data_mover_pod_name(executor.job_name)}:{executor.code_dir}/nsys_profile/{name}",
+        str(destination / name),
+    ]
+    assert (destination / name).read_bytes() == b"x" * 12
+    assert (destination / name).stat().st_mode & 0o777 == 0o600
+    assert json.loads((destination / "collection.json").read_text())["status"] == "collected"
+    assert invoke.call_args.kwargs == {"check": True, "capture_output": True, "text": True, "timeout": 600}
+    executor._delete_data_mover_pod.assert_called_once()
+
+
+@pytest.mark.unit
+def test_diagnostic_single_attempt_is_harvested_by_frozen_ci(diagnostic_executor, tmp_path, monkeypatch):
+    executor = diagnostic_executor
+    nemo_home = tmp_path / "nemo-run"
+    experiment_dir = nemo_home / "experiments" / "capture" / "attempt-1"
+    executor.assign("attempt-1", str(experiment_dir), "training", "training")
+    # CI_PROJECT_DIR can point outside the runner uploader's working directory.
+    monkeypatch.setenv("CI_PROJECT_DIR", str(tmp_path / "different-project-root"))
+    name = "profile_node0_pid7.nsys-rep"
+    monkeypatch.setattr(executor, "_profile_inventory", Mock(return_value=[{"name": name, "bytes": 12}]))
+    executor._copy_profile.side_effect = lambda pod, remote, local: local.write_bytes(b"x" * 12)
+    executor.cleanup("test")
+    assert executor._profile_destination() == Path(executor.job_dir) / "nsys_profile"
+    uploader = tmp_path / "uploader"
+    uploader.mkdir()
+    # Frozen nemo-ci b43, megatron_bridge_ci_template.yml:374-377. Its first-
+    # match selector only supports our explicit single-attempt contract.
+    harvest = """mkdir -p ./nsys_profile/
+NSYS_DIR=$(find "${NEMORUN_HOME}/experiments" -type d -name nsys_profile 2>/dev/null | head -1)
+[ -n "$NSYS_DIR" ] && cp -a "$NSYS_DIR/." ./nsys_profile/ || true
+"""
+    subprocess.run(
+        ["bash", "-c", harvest],
+        cwd=uploader,
+        env={**os.environ, "NEMORUN_HOME": str(nemo_home)},
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert (uploader / "nsys_profile" / name).read_bytes() == b"x" * 12
+    assert json.loads((uploader / "nsys_profile" / "collection.json").read_text())["status"] == "collected"
+    assert not (tmp_path / "different-project-root" / "nsys_profile").exists()
+
+
+@pytest.mark.unit
+def test_diagnostic_stores_attempts_separately_and_retains_empty_attempt(diagnostic_executor, monkeypatch):
     executor = diagnostic_executor
     inventory = Mock(return_value=[])
     monkeypatch.setattr(executor, "_profile_inventory", inventory)
@@ -444,9 +521,9 @@ def test_diagnostic_collects_attempts_separately_and_retains_empty_attempt(diagn
     inventory.return_value = [{"name": "profile_node15_pid7.nsys-rep", "bytes": 12}]
 
     def copy_report(pod, remote, destination):
-        Path(destination, Path(remote).name).write_bytes(b"x" * 12)
+        Path(destination).write_bytes(b"x" * 12)
 
-    executor._rsync_from_pod.side_effect = copy_report
+    executor._copy_profile.side_effect = copy_report
     executor.cleanup("second")
     second = executor._profile_destination()
     result = json.loads((second / "collection.json").read_text())
@@ -456,7 +533,7 @@ def test_diagnostic_collects_attempts_separately_and_retains_empty_attempt(diagn
     assert (second / result["copied"][0]).stat().st_mode & 0o777 == 0o600
     assert json.loads((first / "collection.json").read_text())["status"] == "empty"
     assert executor._delete_data_mover_pod.call_count == 2
-    assert executor._rsync_from_pod.call_args.args[1].endswith("/nsys_profile/profile_node15_pid7.nsys-rep")
+    assert executor._copy_profile.call_args.args[1].endswith("/nsys_profile/profile_node15_pid7.nsys-rep")
 
 
 @pytest.mark.unit
@@ -473,12 +550,12 @@ def test_diagnostic_records_transfer_limits_without_copying(diagnostic_executor,
     executor.cleanup("test")
     result = json.loads((executor._profile_destination() / "collection.json").read_text())
     assert result["status"] == condition
-    executor._rsync_from_pod.assert_not_called()
+    executor._copy_profile.assert_not_called()
     executor._delete_data_mover_pod.assert_called_once()
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("failure", ["start", "inventory", "copy", "mismatch", "delete"])
+@pytest.mark.parametrize("failure", ["start", "inventory", "copy", "timeout", "mismatch", "delete"])
 def test_diagnostic_records_failures_and_always_cleans_mover(diagnostic_executor, monkeypatch, failure):
     executor = diagnostic_executor
     monkeypatch.setattr(
@@ -490,15 +567,17 @@ def test_diagnostic_records_failures_and_always_cleans_mover(diagnostic_executor
     elif failure == "inventory":
         executor._profile_inventory.side_effect = subprocess.CalledProcessError(1, ["kubectl", "exec"])
     elif failure == "copy":
-        executor._rsync_from_pod.side_effect = error
+        executor._copy_profile.side_effect = error
+    elif failure == "timeout":
+        executor._copy_profile.side_effect = subprocess.TimeoutExpired(["kubectl", "cp"], 600)
     else:
         size = 11 if failure == "mismatch" else 12
-        executor._rsync_from_pod.side_effect = lambda pod, remote, destination: Path(
-            destination, Path(remote).name
-        ).write_bytes(b"x" * size)
+        executor._copy_profile.side_effect = lambda pod, remote, destination: Path(destination).write_bytes(
+            b"x" * size
+        )
         if failure == "delete":
             executor._delete_data_mover_pod.side_effect = error
-    with pytest.raises((RuntimeError, ValueError, subprocess.CalledProcessError)):
+    with pytest.raises((RuntimeError, ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired)):
         executor.cleanup("test")
     result = json.loads((executor._profile_destination() / "collection.json").read_text())
     assert result["status"] == "failed"

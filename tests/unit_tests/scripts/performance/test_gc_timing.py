@@ -484,7 +484,11 @@ def test_actual_experiment_run_packages_without_rsync(tmp_path, monkeypatch, fro
     assert job.executor.workdir_local_path is None
     launch.assert_called_once_with(name="train", cmd=["/bin/bash", f"{job.executor.code_dir}/launch.sh"])
     launch_text = Path(job.executor.job_dir, "launch.sh").read_text()
-    assert task.path in launch_text
+    if diagnostic:
+        assert f"{job.executor.code_dir}/gc_probe/bootstrap.py" in launch_text
+        assert " /nemo_run/gc_probe/bootstrap.py " not in launch_text
+    else:
+        assert task.path in launch_text
     assert "PYTHONPATH" not in job.executor.env_vars
     assert "export PYTHONPATH" not in launch_text
     assert not (Path(job.executor.job_dir) / "gc_probe" / "utils").exists()
@@ -500,6 +504,97 @@ def test_actual_experiment_run_packages_without_rsync(tmp_path, monkeypatch, fro
         (Path(job.executor.job_dir) / "gc_probe" / "run_recipe.py").write_text("wrong")
         with pytest.raises(ValueError, match="different GC timing bundle"):
             job.executor.package(job.executor.packager, "train")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["torchrun", "/nemo_run/scripts/wrapper.sh"],
+        ["bash", "-c", "python /nemo_run/gc_probe/bootstrap.py"],
+        ["python", "/nemo_run/gc_probe/bootstrap.py", "/nemo_run/gc_probe/bootstrap.py"],
+    ],
+)
+def test_gc_materialization_rejects_wrapped_or_ambiguous_commands(tmp_path, frozen_kubeflow_clients, command):
+    executor = GCTimingKubeflowExecutor(workdir_pvc="test", workdir_pvc_path=str(tmp_path / "pvc"))
+    executor.assign("test", str(tmp_path / "jobs"), "train", "train")
+    with pytest.raises(ValueError, match="one unwrapped bootstrap token"):
+        executor.materialize_launch_script(command)
+    assert not Path(executor.job_dir).exists()
+
+
+def test_rendered_launch_executes_direct_pvc_probe_with_existing_image_directory(
+    tmp_path, monkeypatch, frozen_kubeflow_clients
+):
+    """Run frozen launch.sh in the container; replace only GPU torchrun work."""
+    import nemo_run as run
+
+    assert shutil.which("rsync") is None
+    alias = Path("/nemo_run")
+    assert not alias.is_symlink()
+    alias.mkdir(exist_ok=True)
+    original_inode = alias.stat().st_ino
+    sentinel = alias / "gc-proof-preserve.txt"
+    sentinel.write_text("preserve the existing image directory")
+    stage = tmp_path / "stage"
+    executor = GCTimingKubeflowExecutor(
+        workdir_pvc="test",
+        workdir_pvc_path=str(tmp_path / "pvc"),
+        gc_staging_dir=str(stage),
+        gc_performance_dir=str(PERFORMANCE_DIR),
+    )
+    executor.assign("filesystem-proof", str(tmp_path / "jobs"), "train", "train")
+    executor.create_job_dir()
+    monkeypatch.setattr(run.KubeflowExecutor, "_start_data_mover_pod", lambda self, pod: None)
+    monkeypatch.setattr(run.KubeflowExecutor, "_delete_data_mover_pod", lambda self, pod: None)
+    monkeypatch.setattr(
+        run.KubeflowExecutor,
+        "_rsync_to_pod",
+        lambda self, pod, local, remote: shutil.copytree(local, remote, dirs_exist_ok=True),
+    )
+    checker_dir = tmp_path / "checker"
+    checker_dir.mkdir()
+    checker = checker_dir / "torchrun"
+    checker.write_text(
+        f"#!{sys.executable}\n"
+        + textwrap.dedent("""\
+        import logging
+        import sys
+        from pathlib import Path
+        logging.basicConfig(level=logging.INFO)
+        scripts = [Path(value) for value in sys.argv[1:] if value.endswith('/gc_probe/bootstrap.py')]
+        assert len(scripts) == 1
+        script = scripts[0]
+        if not script.is_file():
+            logging.getLogger(__name__).info('STAGED_PROBE_MISSING')
+            sys.exit(2)
+        assert sorted(path.name for path in script.parent.iterdir()) == [
+            'bootstrap.py', 'gc_timing_recorder.py', 'run_recipe.py']
+        logging.getLogger(__name__).info('STAGED_COMMAND_CHECKER_REACHED')
+        """)
+    )
+    checker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = str(checker_dir) + os.pathsep + environment["PATH"]
+    command = ["torchrun", "--standalone", "--nproc-per-node=1", "/nemo_run/gc_probe/bootstrap.py", "--use_recipes"]
+
+    # The exact frozen native template fails when its legacy alias is a directory.
+    run.KubeflowExecutor.materialize_launch_script(executor, command)
+    executor.package(executor.packager, "train")
+    remote_script = Path(executor.code_dir) / "launch.sh"
+    old = subprocess.run(["bash", str(remote_script)], env=environment, capture_output=True, text=True, timeout=15)
+    assert old.returncode == 2
+    assert "STAGED_PROBE_MISSING" in old.stderr
+    assert (alias / "code").is_symlink()
+    assert not (alias / "gc_probe" / "bootstrap.py").exists()
+
+    executor.materialize_launch_script(command)
+    executor.package(executor.packager, "train")
+    fixed = subprocess.run(["bash", str(remote_script)], env=environment, capture_output=True, text=True, timeout=15)
+    assert fixed.returncode == 0, fixed.stdout + fixed.stderr
+    assert "STAGED_COMMAND_CHECKER_REACHED" in fixed.stderr
+    assert alias.is_dir() and not alias.is_symlink() and alias.stat().st_ino == original_inode
+    assert sentinel.read_text() == "preserve the existing image directory"
+    assert (Path(executor.code_dir) / "gc_probe" / "bootstrap.py").is_file()
 
 
 def test_actual_launcher_and_staged_bootstrap_handoff(tmp_path, monkeypatch, frozen_kubeflow_clients):

@@ -96,6 +96,21 @@ class GCTimingKubeflowExecutor(run.KubeflowExecutor):
     gc_staging_dir: str | None = None
     gc_performance_dir: str | None = None
 
+    def materialize_launch_script(self, cmd: list[str], max_retries: int = 0) -> None:
+        """Use the assigned PVC path; the image's /nemo_run is a real directory."""
+        bootstrap = "/nemo_run/gc_probe/bootstrap.py"
+        if (
+            cmd.count(bootstrap) != 1
+            or not self.workdir_pvc
+            or not getattr(self, "experiment_id", None)
+            or not getattr(self, "job_name", None)
+        ):
+            raise ValueError("GC timing requires one unwrapped bootstrap token and an assigned PVC path.")
+        resolved = f"{self.code_dir}/gc_probe/bootstrap.py"
+        super().materialize_launch_script(
+            [resolved if token == bootstrap else token for token in cmd], max_retries=max_retries
+        )
+
     def package(self, packager: Packager, job_name: str) -> None:
         """Copy only owned probe files; preserve ordinary Kubeflow upload/cleanup."""
         if (

@@ -156,9 +156,11 @@ done
             logger.info("Nsight collection outcome: %s; manifest: %s", manifest["status"], manifest_path)
 
 
-# Frozen NeMo-Run dispatches by exact executor type, rather than isinstance.
-# Keep the normal Kubeflow and reverse mappings intact.
+# Frozen NeMo-Run dispatch and parallel capability checks use exact types.
+# Preserve base/reverse mappings and Kubeflow's existing attached-only behavior.
 EXECUTOR_MAPPING[DiagnosticKubeflowExecutor] = EXECUTOR_MAPPING[run.KubeflowExecutor]
+if DiagnosticKubeflowExecutor not in run.Experiment._PARALLEL_SUPPORTED_EXECUTORS:
+    run.Experiment._PARALLEL_SUPPORTED_EXECUTORS += (DiagnosticKubeflowExecutor,)
 
 
 def _kubeflow_numa_binding_script(task: run.Script) -> run.Script:

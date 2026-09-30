@@ -231,11 +231,15 @@ def test_recipe_env_vars_are_added_to_kubeflow_trainer_environment(monkeypatch):
 
 
 @pytest.fixture
-def mock_kubeflow_clients(monkeypatch):
+def mock_kubeflow_clients(monkeypatch, tmp_path):
     if not HAS_NEMO_RUN:
         pytest.skip("nemo_run not installed")
+    from nemo_run import config as nemo_run_config
     from nemo_run.core.execution import kubeflow
 
+    # Frozen NeMo-Run caches this path at import; changing the environment alone
+    # would still write experiment metadata outside the test directory.
+    monkeypatch.setattr(nemo_run_config, "_NEMORUN_HOME", str(tmp_path / "nemo-run"))
     monkeypatch.setattr(kubeflow, "_KUBERNETES_AVAILABLE", True)
     monkeypatch.setattr(nemo_run.KubeflowExecutor, "_load_kube_clients", Mock())
 
@@ -306,7 +310,6 @@ def test_diagnostic_executor_survives_serialization_and_experiment_assignment(
     from nemo_run.core.serialization.zlib_json import ZlibJSONSerializer
     from nemo_run.run.torchx_backend.schedulers.api import REVERSE_EXECUTOR_MAPPING, get_executor_str
 
-    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path / "nemo-run"))
     executor = DiagnosticKubeflowExecutor(
         launcher=nemo_run.Torchrun(nsys_profile=True), workdir_pvc="test", workdir_pvc_path="/workspace"
     )
@@ -319,10 +322,63 @@ def test_diagnostic_executor_survives_serialization_and_experiment_assignment(
         experiment.add(nemo_run.Script(path="/opt/Megatron-Bridge/scripts/performance/bootstrap.py"), name="train")
         assigned = experiment.jobs[0].executor
         assert type(assigned) is DiagnosticKubeflowExecutor
+        assert Path(assigned.job_dir).is_relative_to(tmp_path / "nemo-run")
         prefix = assigned.get_launcher_prefix()
         assert assigned.experiment_id
         assert assigned.job_name == "train"
         assert prefix[prefix.index("-o") + 1].startswith(assigned.code_dir + "/nsys_profile/")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("profiling", [False, True])
+def test_diagnostic_experiment_runs_through_scheduler_and_terminal_cleanup(
+    tmp_path, monkeypatch, mock_kubeflow_clients, profiling
+):
+    from nemo_run.core.execution.kubeflow import KubeflowJobState
+    from torchx.specs import AppState
+
+    monkeypatch.setenv("CI_PROJECT_DIR", str(tmp_path / "artifacts"))
+    # Keep Experiment.run, its DAG gate, Job.launch, scheduler dispatch and
+    # persistence real. Only replace cluster and data-mover operations.
+    package = Mock()
+    launch = Mock(return_value=("diagnostic-job", KubeflowJobState.CREATED))
+    mover_start = Mock()
+    mover_delete = Mock()
+    monkeypatch.setattr(nemo_run.KubeflowExecutor, "package", package)
+    monkeypatch.setattr(nemo_run.KubeflowExecutor, "launch", launch)
+    monkeypatch.setattr(nemo_run.KubeflowExecutor, "status", Mock(return_value=KubeflowJobState.SUCCEEDED))
+    monkeypatch.setattr(DiagnosticKubeflowExecutor, "_start_data_mover_pod", mover_start)
+    monkeypatch.setattr(DiagnosticKubeflowExecutor, "_delete_data_mover_pod", mover_delete)
+    monkeypatch.setattr(DiagnosticKubeflowExecutor, "_profile_inventory", Mock(return_value=[]))
+    executor = DiagnosticKubeflowExecutor(
+        launcher=nemo_run.Torchrun(nsys_profile=profiling),
+        namespace="test",
+        workdir_pvc="test-workdir",
+        workdir_pvc_path="/workspace",
+        num_nodes=16,
+        gpus_per_node=4,
+    )
+    with nemo_run.Experiment("diagnostic-run", executor=executor) as experiment:
+        experiment.add(nemo_run.Script(inline="true"), name="train")
+        experiment.run()
+        job = experiment.jobs[0]
+        assert job.launched
+        assert Path(job.executor.job_dir).is_relative_to(tmp_path / "nemo-run")
+        assert job.handle.startswith("kubeflow://")
+        assert experiment.detach is False
+
+    assert job.state is AppState.SUCCEEDED
+    package.assert_called_once()
+    launch.assert_called_once_with(name="train", cmd=["/bin/bash", f"{job.executor.code_dir}/launch.sh"])
+    manifest = job.executor._profile_destination() / "collection.json"
+    if profiling:
+        assert json.loads(manifest.read_text())["status"] == "empty"
+        mover_start.assert_called_once()
+        mover_delete.assert_called_once()
+    else:
+        assert not manifest.exists()
+        mover_start.assert_not_called()
+        mover_delete.assert_not_called()
 
 
 @pytest.mark.unit

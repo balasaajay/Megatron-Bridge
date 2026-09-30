@@ -591,6 +591,13 @@ def parse_cli_args():
         default=None,
     )
     kubeflow_args.add_argument(
+        "--kubeflow_gc_timing_stage",
+        type=str,
+        default=None,
+        help="Diagnostic only: explicitly stage a bounded GC timing entrypoint at this local path. "
+        "Requires Kubeflow, the frozen recipe pretrain entrypoint, no GPU profiler, and no separate source overlay.",
+    )
+    kubeflow_args.add_argument(
         "--kubeflow_image_pull_secrets",
         type=list_of_strings,
         help="Comma-separated list of Kubernetes image pull secret names.",

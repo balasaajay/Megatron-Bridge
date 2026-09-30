@@ -239,6 +239,7 @@ def kubeflow_executor(
     container_kwargs: Optional[Dict[str, Any]] = None,
     labels: Optional[Dict[str, Any]] = None,
     pod_annotations: Optional[Dict[str, Any]] = None,
+    executor_cls: type[run.KubeflowExecutor] | None = None,
 ) -> run.KubeflowExecutor:
     """Build a Kubeflow Training Operator executor.
 
@@ -280,6 +281,7 @@ def kubeflow_executor(
         labels: Pod labels.
         pod_annotations: Annotations applied to the trainer pod template metadata
             (e.g. ``networking.gke.io/interfaces`` for GKE RDMA NIC attachment).
+        executor_cls: Executor class; the default preserves ordinary Kubeflow behavior.
 
     Returns:
         Configured ``run.KubeflowExecutor`` instance.
@@ -311,7 +313,8 @@ def kubeflow_executor(
     }
     labels = {**ci_labels, **(labels or {})}
 
-    executor = run.KubeflowExecutor(
+    executor_type = executor_cls or run.KubeflowExecutor
+    executor = executor_type(
         # Launch each replica's entrypoint under torchrun so the torch-distributed
         # ClusterTrainingRuntime's rendezvous env (MASTER_ADDR, nnodes, nproc) is
         # consumed and a single WORLD_SIZE = num_nodes * gpus_per_node process

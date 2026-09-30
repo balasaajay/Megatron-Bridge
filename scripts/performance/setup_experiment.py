@@ -544,6 +544,7 @@ def main(
     config_variant: str | None = None,
     gres: Optional[str] = None,
     packager: str = "git",
+    kubeflow_gc_timing_stage: str | None = None,
 ):
     """Sets up the experiment and runs it."""
     if (
@@ -568,6 +569,25 @@ def main(
 
     if export_nsys_sqlite and not enable_nsys:
         logger.warning("--export_nsys_sqlite was set without --enable_nsys; no Nsys SQLite export will be generated.")
+
+    if kubeflow_gc_timing_stage:
+        if (
+            not kubeflow_namespace
+            or not use_recipes
+            or task != "pretrain"
+            or enable_nsys
+            or pytorch_profiler
+            or record_memory_history
+        ):
+            raise ValueError(
+                "GC timing requires Kubeflow with the frozen recipe pretrain entrypoint and no GPU profiler."
+            )
+        stage_path = Path(kubeflow_gc_timing_stage)
+        if kubeflow_workdir_local_path:
+            raise ValueError("GC timing cannot be combined with a separate workdir source overlay.")
+        from utils.gc_timing_stage import stage_gc_timing
+
+        stage_gc_timing(destination=stage_path, performance_dir=SCRIPT_DIR)
 
     script_name = ENTRYPOINT_BOOTSTRAP
     # Keep the historical W&B-name behavior for CI. The lightweight fallback
@@ -615,6 +635,8 @@ def main(
     if kubeflow_namespace:
         in_container_script_dir = "/opt/Megatron-Bridge/scripts/performance"
         in_container_script_path = f"{in_container_script_dir}/{script_name}"
+        if kubeflow_gc_timing_stage:
+            in_container_script_path = "/nemo_run/gc_probe/bootstrap.py"
     else:
         in_container_script_dir = str(SCRIPT_DIR)
         in_container_script_path = str(run_script_path)
@@ -634,6 +656,11 @@ def main(
         peak_mem_clk = None
 
     if kubeflow_namespace:
+        gc_executor_kwargs = {}
+        if kubeflow_gc_timing_stage:
+            from utils.gc_timing_stage import GCTimingKubeflowExecutor
+
+            gc_executor_kwargs["executor_cls"] = GCTimingKubeflowExecutor
         if enable_vboost or lock_gpu_freq is not None or peak_mem_clk is not None:
             logger.warning(
                 "--enable_vboost, --lock_gpu_freq, and --peak_mem_clk are Slurm-only and will be ignored on Kubeflow."
@@ -668,7 +695,11 @@ def main(
             container_kwargs=json.loads(kubeflow_container_kwargs_json) if kubeflow_container_kwargs_json else None,
             labels=json.loads(kubeflow_labels_json) if kubeflow_labels_json else None,
             pod_annotations=(json.loads(kubeflow_pod_annotations_json) if kubeflow_pod_annotations_json else None),
+            **gc_executor_kwargs,
         )
+        if kubeflow_gc_timing_stage:
+            executor.gc_staging_dir = kubeflow_gc_timing_stage
+            executor.gc_performance_dir = str(SCRIPT_DIR)
     else:
         executor = slurm_executor(
             gpu=gpu,
@@ -1073,4 +1104,5 @@ if __name__ == "__main__":
         config_variant=config_variant,
         gres=args.gres,
         packager=args.packager,
+        kubeflow_gc_timing_stage=args.kubeflow_gc_timing_stage,
     )

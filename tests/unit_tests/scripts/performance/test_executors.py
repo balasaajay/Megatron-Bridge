@@ -14,9 +14,12 @@
 
 """Tests for scripts/performance/utils/executors.py — container_env on SlurmExecutor."""
 
+import json
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -40,6 +43,7 @@ if HAS_NEMO_RUN:
     from utils.executors import (
         KUBEFLOW_NUMA_BINDING_ENV,
         OFFLINE_BENCHMARK_ENV_VARS,
+        DiagnosticKubeflowExecutor,
         _kubeflow_numa_binding_enabled,
         _kubeflow_numa_binding_script,
         kubeflow_executor,
@@ -208,8 +212,8 @@ def test_vr200_slurm_executor_uses_two_gpus_per_numa_node(tmp_path):
 def test_recipe_env_vars_are_added_to_kubeflow_trainer_environment(monkeypatch):
     """Kubeflow workers should inherit launcher-resolved recipe variables."""
     monkeypatch.setattr(
-        executors_module.run,
-        "KubeflowExecutor",
+        executors_module,
+        "DiagnosticKubeflowExecutor",
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
     recipe_env_vars = {
@@ -224,3 +228,223 @@ def test_recipe_env_vars_are_added_to_kubeflow_trainer_environment(monkeypatch):
     )
 
     assert executor.env_vars.items() >= recipe_env_vars.items()
+
+
+@pytest.fixture
+def mock_kubeflow_clients(monkeypatch):
+    if not HAS_NEMO_RUN:
+        pytest.skip("nemo_run not installed")
+    from nemo_run.core.execution import kubeflow
+
+    monkeypatch.setattr(kubeflow, "_KUBERNETES_AVAILABLE", True)
+    monkeypatch.setattr(nemo_run.KubeflowExecutor, "_load_kube_clients", Mock())
+
+
+@pytest.fixture
+def diagnostic_executor(tmp_path, monkeypatch, mock_kubeflow_clients):
+    monkeypatch.setenv("CI_PROJECT_DIR", str(tmp_path / "artifacts"))
+    executor = DiagnosticKubeflowExecutor(
+        launcher=nemo_run.Torchrun(nsys_profile=True),
+        namespace="test",
+        workdir_pvc="test-workdir",
+        workdir_pvc_path="/workspace",
+        num_nodes=16,
+        gpus_per_node=4,
+    )
+    executor.assign("attempt-1", str(tmp_path / "run"), "training", "training")
+    monkeypatch.setattr(executor, "_start_data_mover_pod", Mock())
+    monkeypatch.setattr(executor, "_delete_data_mover_pod", Mock())
+    monkeypatch.setattr(executor, "_rsync_from_pod", Mock())
+    return executor
+
+
+@pytest.mark.unit
+def test_diagnostic_prefix_uses_one_pvc_output_and_unique_node_names(diagnostic_executor):
+    executor = diagnostic_executor
+    prefix = executor.get_launcher_prefix()
+    assert prefix.count("-o") == 1
+    assert prefix[prefix.index("-o") + 1] == (
+        f"{executor.code_dir}/nsys_profile/profile_node%q{{PET_NODE_RANK}}_pid%p"
+    )
+    assert Path(executor.job_dir, "nsys_profile").is_dir()
+    assert "--capture-range=cudaProfilerApi" in prefix
+    assert executor.workdir_local_path is None
+
+
+@pytest.mark.unit
+def test_diagnostic_disabled_preserves_launcher_and_does_not_collect(diagnostic_executor):
+    executor = diagnostic_executor
+    executor.launcher.nsys_profile = False
+    assert executor.get_launcher_prefix() is None
+    assert executor.launcher.nsys_filename == "profile_%p"
+    executor.cleanup("test-handle")
+    executor._start_data_mover_pod.assert_not_called()
+    assert not Path(executor.job_dir, "nsys_profile").exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("invalid", ["unassigned", "no-pvc", "absolute-folder", "extra-output"])
+def test_diagnostic_prefix_rejects_unrecoverable_configuration(diagnostic_executor, invalid):
+    executor = diagnostic_executor
+    if invalid == "unassigned":
+        executor.job_dir = ""
+    elif invalid == "no-pvc":
+        executor.workdir_pvc = None
+    elif invalid == "absolute-folder":
+        executor.launcher.nsys_folder = "/tmp/profiles"
+    else:
+        executor.launcher.nsys_extra_args.append("--output=/tmp/other")
+    with pytest.raises(ValueError):
+        executor.get_launcher_prefix()
+
+
+@pytest.mark.unit
+def test_diagnostic_executor_survives_serialization_and_experiment_assignment(
+    tmp_path, monkeypatch, mock_kubeflow_clients
+):
+    import fiddle as fdl
+    from nemo_run.core.serialization.zlib_json import ZlibJSONSerializer
+    from nemo_run.run.torchx_backend.schedulers.api import REVERSE_EXECUTOR_MAPPING, get_executor_str
+
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path / "nemo-run"))
+    executor = DiagnosticKubeflowExecutor(
+        launcher=nemo_run.Torchrun(nsys_profile=True), workdir_pvc="test", workdir_pvc_path="/workspace"
+    )
+    serializer = ZlibJSONSerializer()
+    cloned = fdl.build(serializer.deserialize(serializer.serialize(executor.clone().to_config())))
+    assert type(cloned) is DiagnosticKubeflowExecutor
+    assert get_executor_str(cloned) == "kubeflow"
+    assert REVERSE_EXECUTOR_MAPPING["kubeflow"] is nemo_run.KubeflowExecutor
+    with nemo_run.Experiment("diagnostic-serialization", executor=cloned) as experiment:
+        experiment.add(nemo_run.Script(path="/opt/Megatron-Bridge/scripts/performance/bootstrap.py"), name="train")
+        assigned = experiment.jobs[0].executor
+        assert type(assigned) is DiagnosticKubeflowExecutor
+        prefix = assigned.get_launcher_prefix()
+        assert assigned.experiment_id
+        assert assigned.job_name == "train"
+        assert prefix[prefix.index("-o") + 1].startswith(assigned.code_dir + "/nsys_profile/")
+
+
+@pytest.mark.unit
+def test_terminal_job_cleanup_preserves_collection_failure(diagnostic_executor, monkeypatch):
+    from nemo_run.run.job import Job
+    from torchx.specs import AppState
+
+    executor = diagnostic_executor
+    monkeypatch.setattr(executor, "_profile_inventory", Mock(side_effect=RuntimeError("inventory failed")))
+    job = Job(id="train", task=nemo_run.Script(path="train.py"), executor=executor)
+    job.handle = "kubeflow://test/diagnostic"
+    job.state = AppState.RUNNING
+    job.cleanup()
+    executor._start_data_mover_pod.assert_not_called()
+    job.state = AppState.SUCCEEDED
+    job.cleanup()  # The framework suppresses cleanup errors; the manifest must survive.
+    result = json.loads((executor._profile_destination() / "collection.json").read_text())
+    assert result["status"] == "failed"
+    assert result["error_type"] == "RuntimeError"
+    assert job.state is AppState.SUCCEEDED
+    executor._delete_data_mover_pod.assert_called_once()
+
+
+@pytest.mark.unit
+def test_diagnostic_inventory_is_quoted_and_validated(diagnostic_executor, monkeypatch):
+    invoke = Mock(return_value=SimpleNamespace(stdout="12\tprofile_node0_pid9.nsys-rep\n"))
+    monkeypatch.setattr(executors_module.subprocess, "run", invoke)
+    remote = "/workspace/path with spaces/nsys_profile"
+    assert diagnostic_executor._profile_inventory("mover", remote) == [
+        {"name": "profile_node0_pid9.nsys-rep", "bytes": 12}
+    ]
+    command = invoke.call_args.args[0]
+    assert command[-1] == remote
+    assert remote not in command[-3]
+    assert invoke.call_args.kwargs["timeout"] == 120
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "inventory",
+    [
+        "2\t../escape.nsys-rep\n",
+        "-1\tprofile_node0_pid9.nsys-rep\n",
+        "2\tprofile_node0_pid9.nsys-rep\n2\tprofile_node0_pid9.nsys-rep\n",
+    ],
+)
+def test_diagnostic_rejects_unsafe_inventory(diagnostic_executor, monkeypatch, inventory):
+    monkeypatch.setattr(executors_module.subprocess, "run", Mock(return_value=SimpleNamespace(stdout=inventory)))
+    with pytest.raises(ValueError):
+        diagnostic_executor._profile_inventory("mover", "/workspace/profiles")
+
+
+@pytest.mark.unit
+def test_diagnostic_collects_attempts_separately_and_retains_empty_attempt(diagnostic_executor, monkeypatch):
+    executor = diagnostic_executor
+    inventory = Mock(return_value=[])
+    monkeypatch.setattr(executor, "_profile_inventory", inventory)
+    executor.cleanup("first")
+    first = executor._profile_destination()
+    assert json.loads((first / "collection.json").read_text())["status"] == "empty"
+
+    executor.assign("attempt-2", executor.experiment_dir, "training", "second")
+    inventory.return_value = [{"name": "profile_node15_pid7.nsys-rep", "bytes": 12}]
+
+    def copy_report(pod, remote, destination):
+        Path(destination, Path(remote).name).write_bytes(b"x" * 12)
+
+    executor._rsync_from_pod.side_effect = copy_report
+    executor.cleanup("second")
+    second = executor._profile_destination()
+    result = json.loads((second / "collection.json").read_text())
+    assert second != first
+    assert result["status"] == "collected"
+    assert result["copied"] == ["profile_node15_pid7.nsys-rep"]
+    assert (second / result["copied"][0]).stat().st_mode & 0o777 == 0o600
+    assert json.loads((first / "collection.json").read_text())["status"] == "empty"
+    assert executor._delete_data_mover_pod.call_count == 2
+    assert executor._rsync_from_pod.call_args.args[1].endswith("/nsys_profile/profile_node15_pid7.nsys-rep")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("condition", ["over_budget", "insufficient_space"])
+def test_diagnostic_records_transfer_limits_without_copying(diagnostic_executor, monkeypatch, condition):
+    executor = diagnostic_executor
+    monkeypatch.setattr(
+        executor, "_profile_inventory", Mock(return_value=[{"name": "profile_node0_pid7.nsys-rep", "bytes": 12}])
+    )
+    if condition == "over_budget":
+        monkeypatch.setattr(executors_module, "_NSYS_REPORT_BUDGET_BYTES", 10)
+    else:
+        monkeypatch.setattr(executors_module.shutil, "disk_usage", Mock(return_value=SimpleNamespace(free=1)))
+    executor.cleanup("test")
+    result = json.loads((executor._profile_destination() / "collection.json").read_text())
+    assert result["status"] == condition
+    executor._rsync_from_pod.assert_not_called()
+    executor._delete_data_mover_pod.assert_called_once()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", ["start", "inventory", "copy", "mismatch", "delete"])
+def test_diagnostic_records_failures_and_always_cleans_mover(diagnostic_executor, monkeypatch, failure):
+    executor = diagnostic_executor
+    monkeypatch.setattr(
+        executor, "_profile_inventory", Mock(return_value=[{"name": "profile_node0_pid7.nsys-rep", "bytes": 12}])
+    )
+    error = RuntimeError("simulated failure")
+    if failure == "start":
+        executor._start_data_mover_pod.side_effect = error
+    elif failure == "inventory":
+        executor._profile_inventory.side_effect = subprocess.CalledProcessError(1, ["kubectl", "exec"])
+    elif failure == "copy":
+        executor._rsync_from_pod.side_effect = error
+    else:
+        size = 11 if failure == "mismatch" else 12
+        executor._rsync_from_pod.side_effect = lambda pod, remote, destination: Path(
+            destination, Path(remote).name
+        ).write_bytes(b"x" * size)
+        if failure == "delete":
+            executor._delete_data_mover_pod.side_effect = error
+    with pytest.raises((RuntimeError, ValueError, subprocess.CalledProcessError)):
+        executor.cleanup("test")
+    result = json.loads((executor._profile_destination() / "collection.json").read_text())
+    assert result["status"] == "failed"
+    assert "error_type" in result
+    executor._delete_data_mover_pod.assert_called_once()

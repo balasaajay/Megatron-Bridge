@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,15 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
+import re
 import shlex
+import shutil
+import stat
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import nemo_run as run
 from nemo_run.config import get_nemorun_home, set_nemorun_home
 from nemo_run.core.execution.launcher import SlurmTemplate
+from nemo_run.run.torchx_backend.schedulers.api import EXECUTOR_MAPPING
 
 
 DEFAULT_NEMO_CACHE_HOME = Path.home() / ".cache" / "nemo"
@@ -28,6 +35,130 @@ DEFAULT_NEMO_HOME = os.getenv("NEMO_HOME", DEFAULT_NEMO_CACHE_HOME)
 logger = logging.getLogger(__name__)
 
 KUBEFLOW_NUMA_BINDING_ENV = "NEMO_KUBEFLOW_NUMA_BINDING"
+_NSYS_REPORT_BUDGET_BYTES = 5 * 1024**3
+_NSYS_REPORT_NAME = re.compile(r"profile_node[0-9]+_pid[0-9]+\.nsys-rep")
+
+
+@dataclass(kw_only=True)
+class DiagnosticKubeflowExecutor(run.KubeflowExecutor):
+    """Persist bounded Nsight reports for the isolated GCP diagnostic launcher.
+
+    NeMo-Run calls ``cleanup`` on its assigned executor after a terminal job.
+    Reports are copied into the existing CI artifact directory, separated by
+    experiment and task, so automatic retries cannot shadow completed captures.
+    The normal, non-profiled execution path is unchanged.
+    """
+
+    def get_launcher_prefix(self) -> list[str] | None:
+        """Create the packaged output folder locally and target its PVC counterpart."""
+        launcher = self.get_launcher()
+        if not launcher.nsys_profile:
+            return super().get_launcher_prefix()
+        if not self.workdir_pvc or not self.job_dir or not self.experiment_id or not self.job_name:
+            raise ValueError("Nsight diagnostics require an assigned executor with a workdir PVC")
+        if launcher.nsys_folder != "nsys_profile":
+            raise ValueError("Nsight diagnostics require the relative nsys_profile folder")
+        if any(arg.split("=", 1)[0] in ("-o", "--output") for arg in launcher.nsys_extra_args):
+            raise ValueError("Nsight output is managed by the diagnostic executor")
+
+        # package() copies this local folder into code_dir before trainer launch.
+        super().get_launcher_prefix()
+        launcher.nsys_filename = "profile_node%q{PET_NODE_RANK}_pid%p"
+        return launcher.get_nsys_prefix(profile_dir=self.code_dir)
+
+    def _profile_destination(self) -> Path:
+        for component in (self.experiment_id, self.job_name):
+            if not component or component in (".", "..") or Path(component).name != component:
+                raise ValueError("Nsight artifact paths require single-component experiment and task names")
+        root = Path(os.environ.get("CI_PROJECT_DIR", self.job_dir)) / "nsys_profile"
+        destination = root / self.experiment_id / self.job_name
+        destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination.chmod(0o700)
+        return destination
+
+    def _profile_inventory(self, pod_name: str, remote_path: str) -> list[dict[str, str | int]]:
+        # Alpine supplies sh/stat; keep the remote path out of shell source and
+        # never enumerate environment variables or commands in the mover pod.
+        script = """set -eu
+for report in "$1"/*.nsys-rep; do
+    [ -e "$report" ] || [ -L "$report" ] || continue
+    [ -f "$report" ] && [ ! -L "$report" ] || exit 3
+    size=$(stat -c '%s' "$report")
+    printf '%s\\t%s\\n' "$size" "${report##*/}"
+done
+"""
+        result = subprocess.run(
+            ["kubectl", "exec", "-n", self.namespace, pod_name, "--", "sh", "-c", script, "sh", remote_path],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        reports = []
+        seen = set()
+        for line in result.stdout.splitlines():
+            size, name = line.split("\t", 1)
+            if not _NSYS_REPORT_NAME.fullmatch(name) or name in seen or not size.isdecimal():
+                raise ValueError("Invalid or duplicate Nsight report inventory entry")
+            seen.add(name)
+            reports.append({"name": name, "bytes": int(size)})
+        return sorted(reports, key=lambda report: str(report["name"]))
+
+    def cleanup(self, handle: str) -> None:
+        """Collect native reports with a byte limit and a durable outcome manifest."""
+        super().cleanup(handle)
+        if not self.get_launcher().nsys_profile:
+            return
+        destination = self._profile_destination()
+        manifest = {"status": "failed", "budget_bytes": _NSYS_REPORT_BUDGET_BYTES, "reports": [], "copied": []}
+        manifest_path = destination / "collection.json"
+        pod_name = self._data_mover_pod_name(self.job_name)
+        remote_path = f"{self.code_dir}/nsys_profile"
+        try:
+            # Starting the pod can fail after creation; always attempt its cleanup.
+            try:
+                self._start_data_mover_pod(pod_name)
+                reports = self._profile_inventory(pod_name, remote_path)
+                manifest["reports"] = reports
+                total_bytes = sum(int(report["bytes"]) for report in reports)
+                manifest["total_bytes"] = total_bytes
+                if not reports:
+                    manifest["status"] = "empty"
+                elif total_bytes > _NSYS_REPORT_BUDGET_BYTES:
+                    manifest["status"] = "over_budget"
+                elif shutil.disk_usage(destination).free < 2 * total_bytes:
+                    manifest["status"] = "insufficient_space"
+                else:
+                    for report in reports:
+                        name = str(report["name"])
+                        self._rsync_from_pod(pod_name, f"{remote_path}/{name}", str(destination))
+                        local_report = destination / name
+                        info = local_report.lstat()
+                        if not stat.S_ISREG(info.st_mode) or info.st_size != report["bytes"]:
+                            raise ValueError("Collected Nsight report does not match its inventory")
+                        local_report.chmod(0o600)
+                        manifest["copied"].append(name)
+                    manifest["status"] = "collected"
+            finally:
+                self._delete_data_mover_pod(pod_name)
+        except Exception as exc:
+            # Job.cleanup logs and suppresses exceptions; preserve a machine-readable
+            # failure even when training succeeded. Do not put subprocess output or
+            # credential-bearing command metadata in the manifest.
+            manifest["status"] = "failed"
+            manifest["error_type"] = type(exc).__name__
+            raise
+        finally:
+            with manifest_path.open("w", encoding="utf-8") as output:
+                json.dump(manifest, output, indent=2)
+                output.write("\n")
+            manifest_path.chmod(0o600)
+            logger.info("Nsight collection outcome: %s; manifest: %s", manifest["status"], manifest_path)
+
+
+# Frozen NeMo-Run dispatches by exact executor type, rather than isinstance.
+# Keep the normal Kubeflow and reverse mappings intact.
+EXECUTOR_MAPPING[DiagnosticKubeflowExecutor] = EXECUTOR_MAPPING[run.KubeflowExecutor]
 
 
 def _kubeflow_numa_binding_script(task: run.Script) -> run.Script:
@@ -311,7 +442,7 @@ def kubeflow_executor(
     }
     labels = {**ci_labels, **(labels or {})}
 
-    executor = run.KubeflowExecutor(
+    executor = DiagnosticKubeflowExecutor(
         # Launch each replica's entrypoint under torchrun so the torch-distributed
         # ClusterTrainingRuntime's rendezvous env (MASTER_ADDR, nnodes, nproc) is
         # consumed and a single WORLD_SIZE = num_nodes * gpus_per_node process
